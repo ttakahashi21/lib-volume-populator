@@ -31,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/json"
@@ -51,6 +52,8 @@ import (
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/component-helpers/storage/volume"
 	"k8s.io/klog/v2"
+	gatewayInformers "sigs.k8s.io/gateway-api/pkg/client/informers/externalversions"
+	referenceGrantv1beta1 "sigs.k8s.io/gateway-api/pkg/client/listers/apis/v1beta1"
 )
 
 const (
@@ -77,31 +80,32 @@ type stringSet struct {
 }
 
 type controller struct {
-	populatorNamespace string
-	populatedFromAnno  string
-	pvcFinalizer       string
-	kubeClient         kubernetes.Interface
-	imageName          string
-	devicePath         string
-	mountPath          string
-	pvcLister          corelisters.PersistentVolumeClaimLister
-	pvcSynced          cache.InformerSynced
-	pvLister           corelisters.PersistentVolumeLister
-	pvSynced           cache.InformerSynced
-	podLister          corelisters.PodLister
-	podSynced          cache.InformerSynced
-	scLister           storagelisters.StorageClassLister
-	scSynced           cache.InformerSynced
-	unstLister         dynamiclister.Lister
-	unstSynced         cache.InformerSynced
-	mu                 sync.Mutex
-	notifyMap          map[string]*stringSet
-	cleanupMap         map[string]*stringSet
-	workqueue          workqueue.RateLimitingInterface
-	populatorArgs      func(bool, *unstructured.Unstructured) ([]string, error)
-	gk                 schema.GroupKind
-	metrics            *metricsManager
-	recorder           record.EventRecorder
+	populatorNamespace   string
+	populatedFromAnno    string
+	pvcFinalizer         string
+	kubeClient           kubernetes.Interface
+	imageName            string
+	devicePath           string
+	mountPath            string
+	pvcLister            corelisters.PersistentVolumeClaimLister
+	pvcSynced            cache.InformerSynced
+	pvLister             corelisters.PersistentVolumeLister
+	pvSynced             cache.InformerSynced
+	podLister            corelisters.PodLister
+	podSynced            cache.InformerSynced
+	scLister             storagelisters.StorageClassLister
+	scSynced             cache.InformerSynced
+	unstLister           dynamiclister.Lister
+	unstSynced           cache.InformerSynced
+	mu                   sync.Mutex
+	notifyMap            map[string]*stringSet
+	cleanupMap           map[string]*stringSet
+	workqueue            workqueue.RateLimitingInterface
+	populatorArgs        func(bool, *unstructured.Unstructured) ([]string, error)
+	gk                   schema.GroupKind
+	metrics              *metricsManager
+	recorder             record.EventRecorder
+	referenceGrantLister referenceGrantv1beta1.ReferenceGrantLister
 }
 
 func RunController(masterURL, kubeconfig, imageName, httpEndpoint, metricsPath, namespace, prefix string,
@@ -144,31 +148,35 @@ func RunController(masterURL, kubeconfig, imageName, httpEndpoint, metricsPath, 
 	scInformer := kubeInformerFactory.Storage().V1().StorageClasses()
 	unstInformer := dynInformerFactory.ForResource(gvr).Informer()
 
+	var gatewayFactory gatewayInformers.SharedInformerFactory
+	referenceGrants := gatewayFactory.Gateway().V1beta1().ReferenceGrants()
+
 	c := &controller{
-		kubeClient:         kubeClient,
-		imageName:          imageName,
-		populatorNamespace: namespace,
-		devicePath:         devicePath,
-		mountPath:          mountPath,
-		populatedFromAnno:  prefix + "/" + populatedFromAnnoSuffix,
-		pvcFinalizer:       prefix + "/" + pvcFinalizerSuffix,
-		pvcLister:          pvcInformer.Lister(),
-		pvcSynced:          pvcInformer.Informer().HasSynced,
-		pvLister:           pvInformer.Lister(),
-		pvSynced:           pvInformer.Informer().HasSynced,
-		podLister:          podInformer.Lister(),
-		podSynced:          podInformer.Informer().HasSynced,
-		scLister:           scInformer.Lister(),
-		scSynced:           scInformer.Informer().HasSynced,
-		unstLister:         dynamiclister.New(unstInformer.GetIndexer(), gvr),
-		unstSynced:         unstInformer.HasSynced,
-		notifyMap:          make(map[string]*stringSet),
-		cleanupMap:         make(map[string]*stringSet),
-		workqueue:          workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter()),
-		populatorArgs:      populatorArgs,
-		gk:                 gk,
-		metrics:            initMetrics(),
-		recorder:           getRecorder(kubeClient, prefix+"-"+controllerNameSuffix),
+		kubeClient:           kubeClient,
+		imageName:            imageName,
+		populatorNamespace:   namespace,
+		devicePath:           devicePath,
+		mountPath:            mountPath,
+		populatedFromAnno:    prefix + "/" + populatedFromAnnoSuffix,
+		pvcFinalizer:         prefix + "/" + pvcFinalizerSuffix,
+		pvcLister:            pvcInformer.Lister(),
+		pvcSynced:            pvcInformer.Informer().HasSynced,
+		pvLister:             pvInformer.Lister(),
+		pvSynced:             pvInformer.Informer().HasSynced,
+		podLister:            podInformer.Lister(),
+		podSynced:            podInformer.Informer().HasSynced,
+		scLister:             scInformer.Lister(),
+		scSynced:             scInformer.Informer().HasSynced,
+		unstLister:           dynamiclister.New(unstInformer.GetIndexer(), gvr),
+		unstSynced:           unstInformer.HasSynced,
+		notifyMap:            make(map[string]*stringSet),
+		cleanupMap:           make(map[string]*stringSet),
+		workqueue:            workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter()),
+		populatorArgs:        populatorArgs,
+		gk:                   gk,
+		metrics:              initMetrics(),
+		recorder:             getRecorder(kubeClient, prefix+"-"+controllerNameSuffix),
+		referenceGrantLister: referenceGrants.Lister(),
 	}
 
 	c.metrics.startListener(httpEndpoint, metricsPath)
@@ -448,6 +456,17 @@ func (c *controller) syncPvc(ctx context.Context, key, pvcNamespace, pvcName str
 	if c.gk.Group != *dataSourceRef.APIGroup || c.gk.Kind != dataSourceRef.Kind || "" == dataSourceRef.Name {
 		// Ignore PVCs that aren't for this populator to handle
 		return nil
+	}
+
+	if dataSourceRef.Namespace != nil && pvc.Namespace != *dataSourceRef.Namespace {
+		// Get all ReferenceGrants in data source's namespace
+		referenceGrants, err := c.referenceGrantLister.ReferenceGrants(*dataSourceRef.Namespace).List(labels.Everything())
+		if err != nil {
+			return fmt.Errorf("error getting ReferenceGrants in %s namespace from api server: %v", *dataSourceRef.Namespace, err)
+		}
+		if allowed, err := IsGranted(ctx, pvc, referenceGrants); err != nil || !allowed {
+			return err
+		}
 	}
 
 	var unstructured *unstructured.Unstructured
