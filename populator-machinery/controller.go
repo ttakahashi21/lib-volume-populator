@@ -52,6 +52,7 @@ import (
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/component-helpers/storage/volume"
 	"k8s.io/klog/v2"
+	gatewayclientset "sigs.k8s.io/gateway-api/pkg/client/clientset/versioned"
 	gatewayInformers "sigs.k8s.io/gateway-api/pkg/client/informers/externalversions"
 	referenceGrantv1beta1 "sigs.k8s.io/gateway-api/pkg/client/listers/apis/v1beta1"
 )
@@ -106,6 +107,7 @@ type controller struct {
 	metrics              *metricsManager
 	recorder             record.EventRecorder
 	referenceGrantLister referenceGrantv1beta1.ReferenceGrantLister
+	referenceGrantSynced cache.InformerSynced
 }
 
 func RunController(masterURL, kubeconfig, imageName, httpEndpoint, metricsPath, namespace, prefix string,
@@ -139,6 +141,11 @@ func RunController(masterURL, kubeconfig, imageName, httpEndpoint, metricsPath, 
 		klog.Fatalf("Failed to create dynamic client: %v", err)
 	}
 
+	gatewayClient, err := gatewayclientset.NewForConfig(cfg)
+	if err != nil {
+		klog.Fatalf("Failed to create gateway client: %v", err)
+	}
+
 	kubeInformerFactory := kubeinformers.NewSharedInformerFactory(kubeClient, time.Second*30)
 	dynInformerFactory := dynamicinformer.NewDynamicSharedInformerFactory(dynClient, time.Second*30)
 
@@ -148,8 +155,8 @@ func RunController(masterURL, kubeconfig, imageName, httpEndpoint, metricsPath, 
 	scInformer := kubeInformerFactory.Storage().V1().StorageClasses()
 	unstInformer := dynInformerFactory.ForResource(gvr).Informer()
 
-	var gatewayFactory gatewayInformers.SharedInformerFactory
-	referenceGrants := gatewayFactory.Gateway().V1beta1().ReferenceGrants()
+	gatewayInformerFactory := gatewayInformers.NewSharedInformerFactory(gatewayClient, time.Second*30)
+	referenceGrants := gatewayInformerFactory.Gateway().V1beta1().ReferenceGrants()
 
 	c := &controller{
 		kubeClient:           kubeClient,
@@ -177,6 +184,7 @@ func RunController(masterURL, kubeconfig, imageName, httpEndpoint, metricsPath, 
 		metrics:              initMetrics(),
 		recorder:             getRecorder(kubeClient, prefix+"-"+controllerNameSuffix),
 		referenceGrantLister: referenceGrants.Lister(),
+		referenceGrantSynced: referenceGrants.Informer().HasSynced,
 	}
 
 	c.metrics.startListener(httpEndpoint, metricsPath)
@@ -249,6 +257,7 @@ func RunController(masterURL, kubeconfig, imageName, httpEndpoint, metricsPath, 
 
 	kubeInformerFactory.Start(stopCh)
 	dynInformerFactory.Start(stopCh)
+	gatewayInformerFactory.Start(stopCh)
 
 	if err = c.run(stopCh); err != nil {
 		klog.Fatalf("Failed to run controller: %v", err)
@@ -374,7 +383,7 @@ func (c *controller) run(stopCh <-chan struct{}) error {
 	defer utilruntime.HandleCrash()
 	defer c.workqueue.ShutDown()
 
-	ok := cache.WaitForCacheSync(stopCh, c.pvcSynced, c.pvSynced, c.podSynced, c.scSynced, c.unstSynced)
+	ok := cache.WaitForCacheSync(stopCh, c.pvcSynced, c.pvSynced, c.podSynced, c.scSynced, c.unstSynced, c.referenceGrantSynced)
 	if !ok {
 		return fmt.Errorf("failed to wait for caches to sync")
 	}
@@ -462,7 +471,9 @@ func (c *controller) syncPvc(ctx context.Context, key, pvcNamespace, pvcName str
 		return nil
 	}
 
+	dataSourceRefNamespace := pvc.Namespace
 	if dataSourceRef.Namespace != nil && pvc.Namespace != *dataSourceRef.Namespace {
+		dataSourceRefNamespace = *dataSourceRef.Namespace
 		// Get all ReferenceGrants in data source's namespace
 		referenceGrants, err := c.referenceGrantLister.ReferenceGrants(*dataSourceRef.Namespace).List(labels.Everything())
 		if err != nil {
@@ -474,7 +485,7 @@ func (c *controller) syncPvc(ctx context.Context, key, pvcNamespace, pvcName str
 	}
 
 	var unstructured *unstructured.Unstructured
-	unstructured, err = c.unstLister.Namespace(pvc.Namespace).Get(dataSourceRef.Name)
+	unstructured, err = c.unstLister.Namespace(dataSourceRefNamespace).Get(dataSourceRef.Name)
 	if err != nil {
 		if !errors.IsNotFound(err) {
 			return err
